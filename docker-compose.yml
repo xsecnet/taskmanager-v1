@@ -1,0 +1,137 @@
+version: "3.9"
+
+# =============================================================================
+# Task Manager — Production stack
+#
+# Komponen:
+#   - mysql      : database, internal-only (port tidak di-expose ke host)
+#   - backend    : API Express + Prisma
+#   - worker     : reminder cron worker (email + calendar)
+#   - frontend   : Nginx serving React build + reverse proxy ke backend
+#   - cloudflared: Cloudflare Tunnel — meng-expose frontend ke internet via
+#                  domain Cloudflare tanpa membuka port publik di VM
+#
+# Tidak ada port di VM yang perlu dibuka ke internet kalau pakai cloudflared.
+# Frontend (port 80) hanya expose ke localhost VM untuk debugging.
+# =============================================================================
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: tm_mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    command:
+      - --default-authentication-plugin=caching_sha2_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./backups:/backups
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - internal
+
+  backend:
+    build:
+      context: ./backend
+    container_name: tm_backend
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      DATABASE_URL: ${DATABASE_URL}
+      JWT_SECRET: ${JWT_SECRET}
+      SESSION_COOKIE_NAME: ${SESSION_COOKIE_NAME}
+      APP_URL: ${APP_URL}
+      API_URL: ${API_URL}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI}
+      GOOGLE_SCOPES: ${GOOGLE_SCOPES}
+      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY}
+      VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY}
+      VAPID_SUBJECT: ${VAPID_SUBJECT}
+    volumes:
+      - uploads_data:/app/uploads
+    command: sh -c "npx prisma migrate deploy && node dist/server.js"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:4000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - internal
+
+  worker:
+    build:
+      context: ./backend
+    container_name: tm_worker
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: ${DATABASE_URL}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI}
+      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY}
+      VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY}
+      VAPID_SUBJECT: ${VAPID_SUBJECT}
+    command: ["node", "dist/workers/reminder.js"]
+    networks:
+      - internal
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Kosongkan supaya frontend pakai relative URL same-origin
+        # (request /api/* di-proxy oleh nginx di container yang sama).
+        VITE_API_URL: ""
+    container_name: tm_frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    # Expose ke localhost VM saja (untuk debugging / health check).
+    # Cloudflared yang akan meng-expose ke internet.
+    ports:
+      - "127.0.0.1:8080:80"
+    networks:
+      - internal
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: tm_cloudflared
+    restart: unless-stopped
+    depends_on:
+      - frontend
+    # Token-based tunnel: paling sederhana, tunnel di-create di
+    # Cloudflare Dashboard, di-set hostname → http://frontend:80,
+    # token disimpan di .env. Tidak perlu config file.
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    networks:
+      - internal
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  mysql_data:
+  uploads_data:

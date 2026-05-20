@@ -1,0 +1,430 @@
+// Prisma schema — Task Manager
+// Database: MySQL 8
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// =====================================================================
+// Enums
+// =====================================================================
+
+enum Role {
+  ADMIN_PROJECT
+  NETWORK_ENGINEER
+  NETWORK_SECURITY_ENGINEER
+  SYSTEM_ENGINEER
+  SAFETY_DRIVER
+}
+
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  BLOCKED
+  REVIEW
+  DONE
+  CANCELLED
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum ProjectStatus {
+  PLANNING
+  ACTIVE
+  ON_HOLD
+  COMPLETED
+  ARCHIVED
+}
+
+enum ReminderChannel {
+  EMAIL
+  CALENDAR
+  BOTH
+}
+
+enum ReminderStatus {
+  PENDING
+  SENT
+  FAILED
+  CANCELLED
+}
+
+enum ActivityType {
+  PROJECT_CREATED
+  PROJECT_UPDATED
+  MEMBER_ADDED
+  MEMBER_REMOVED
+  TASK_CREATED
+  TASK_UPDATED
+  TASK_STATUS_CHANGED
+  TASK_ASSIGNED
+  TASK_DELETED
+  SUBTASK_CREATED
+  SUBTASK_COMPLETED
+  SUBTASK_DELETED
+  ATTACHMENT_UPLOADED
+  ATTACHMENT_DELETED
+  COMMENT_ADDED
+  REMINDER_CREATED
+  REMINDER_SENT
+}
+
+enum NotificationType {
+  MENTION
+  CHAT_MESSAGE
+  TASK_ASSIGNED
+  TASK_STATUS_CHANGED
+  TASK_DUE_SOON
+  REMINDER
+  PROJECT_INVITE
+}
+
+// =====================================================================
+// Core models
+// =====================================================================
+
+model User {
+  id              String   @id @default(cuid())
+  googleId        String   @unique
+  email           String   @unique
+  name            String
+  avatarUrl       String?
+  role            Role     @default(NETWORK_ENGINEER)
+  isActive        Boolean  @default(true)
+
+  // OAuth tokens (untuk worker kirim email & buat calendar event)
+  googleAccessToken   String? @db.Text
+  googleRefreshToken  String? @db.Text
+  googleTokenExpiry   DateTime?
+  googleScopes        String? @db.Text
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  ownedProjects   Project[]      @relation("ProjectOwner")
+  memberships     ProjectMember[]
+  assignedTasks   Task[]         @relation("TaskAssignee")
+  createdTasks    Task[]         @relation("TaskCreator")
+  taskUpdates     TaskUpdate[]
+  reminders       Reminder[]
+  subtasksAssigned Subtask[]     @relation("SubtaskAssignee")
+  attachments     Attachment[]
+  activities      ActivityLog[]
+  chatMessages    ChatMessage[]
+  mentions        MessageMention[]
+  chatReads       ChatRead[]
+  notifications   Notification[]
+  pushSubscriptions PushSubscription[]
+
+  @@index([role])
+}
+
+model Project {
+  id          String         @id @default(cuid())
+  name        String
+  code        String         @unique
+  description String?        @db.Text
+  status      ProjectStatus  @default(PLANNING)
+  startDate   DateTime?
+  endDate     DateTime?
+  progress    Int            @default(0) // 0-100, di-rollup dari task
+
+  ownerId     String
+  owner       User           @relation("ProjectOwner", fields: [ownerId], references: [id])
+
+  members     ProjectMember[]
+  tasks       Task[]
+  activities  ActivityLog[]
+  messages    ChatMessage[]
+  reads       ChatRead[]
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([status])
+  @@index([ownerId])
+}
+
+model ProjectMember {
+  id        String   @id @default(cuid())
+  projectId String
+  userId    String
+  role      Role     // role di project ini (bisa beda dari role default user)
+
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  joinedAt  DateTime @default(now())
+
+  @@unique([projectId, userId])
+  @@index([userId])
+}
+
+model Task {
+  id          String        @id @default(cuid())
+  projectId   String
+  title       String
+  description String?       @db.Text
+  status      TaskStatus    @default(TODO)
+  priority    TaskPriority  @default(MEDIUM)
+  progress    Int           @default(0) // 0-100
+
+  // Bobot kontribusi ke kurva S project. Default 1.
+  // Admin bisa naikkan untuk task yang lebih besar (mis. milestone).
+  weight      Int           @default(1)
+
+  // Divisi yang bertanggung jawab atas task ini
+  division    Role
+
+  startAt     DateTime?
+  dueAt       DateTime?
+  completedAt DateTime?
+
+  assigneeId  String?
+  creatorId   String
+
+  project     Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  assignee    User?         @relation("TaskAssignee", fields: [assigneeId], references: [id])
+  creator     User          @relation("TaskCreator", fields: [creatorId], references: [id])
+
+  updates     TaskUpdate[]
+  reminders   Reminder[]
+  subtasks    Subtask[]
+  attachments Attachment[]
+  activities  ActivityLog[]
+  chatMessages ChatMessage[] @relation("MessageEmbedTask")
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([projectId])
+  @@index([assigneeId])
+  @@index([division])
+  @@index([status])
+  @@index([dueAt])
+}
+
+model TaskUpdate {
+  id        String   @id @default(cuid())
+  taskId    String
+  authorId  String
+  note      String   @db.Text
+  progress  Int?     // optional, jika user sekaligus update progress
+  status    TaskStatus?
+
+  task      Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  author    User     @relation(fields: [authorId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([taskId])
+}
+
+model Reminder {
+  id          String          @id @default(cuid())
+  taskId      String
+  userId      String          // penerima reminder
+  remindAt    DateTime
+  channel     ReminderChannel @default(BOTH)
+  status      ReminderStatus  @default(PENDING)
+  message     String?         @db.Text
+
+  // Hasil eksekusi
+  sentAt              DateTime?
+  errorMessage        String?  @db.Text
+  googleCalendarEventId String?
+
+  task        Task   @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  user        User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([remindAt, status])
+  @@index([userId])
+  @@index([taskId])
+}
+
+// =====================================================================
+// Sub-task: pekerjaan kecil di bawah satu task, masing-masing bisa
+// punya PIC (assignee) berbeda. Progress task induk di-rollup dari
+// rasio sub-task selesai.
+// =====================================================================
+
+model Subtask {
+  id          String   @id @default(cuid())
+  taskId      String
+  title       String
+  isDone      Boolean  @default(false)
+  assigneeId  String?
+  dueAt       DateTime?
+  position    Int      @default(0)
+  completedAt DateTime?
+
+  task        Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  assignee    User?    @relation("SubtaskAssignee", fields: [assigneeId], references: [id])
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([taskId])
+  @@index([assigneeId])
+}
+
+// =====================================================================
+// Attachment: file/foto lapangan yang menempel di sebuah task.
+// File fisik disimpan di disk (uploads/), DB hanya simpan metadata.
+// =====================================================================
+
+model Attachment {
+  id           String   @id @default(cuid())
+  taskId       String
+  uploaderId   String
+  fileName     String   // nama file di server
+  originalName String   // nama asli yang user upload
+  mimeType     String
+  sizeBytes    Int
+  url          String   // path /uploads/<filename> yang di-serve backend
+
+  task         Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  uploader     User     @relation(fields: [uploaderId], references: [id])
+
+  createdAt    DateTime @default(now())
+
+  @@index([taskId])
+}
+
+// =====================================================================
+// ActivityLog: jejak audit setiap perubahan untuk feed real-time-ish
+// di dashboard & halaman project. Pakai polling/short-lived query.
+// =====================================================================
+
+model ActivityLog {
+  id          String       @id @default(cuid())
+  type        ActivityType
+  actorId     String       // user yang melakukan aksi
+  projectId   String?
+  taskId      String?
+  message     String       @db.Text  // pesan readable, sudah di-render di server
+  meta        Json?        // payload tambahan opsional
+
+  actor       User         @relation(fields: [actorId], references: [id])
+  project     Project?     @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  task        Task?        @relation(fields: [taskId], references: [id], onDelete: SetNull)
+
+  createdAt   DateTime     @default(now())
+
+  @@index([projectId, createdAt])
+  @@index([taskId, createdAt])
+  @@index([createdAt])
+}
+
+// =====================================================================
+// Chat per project: pesan, mention, embed task, pin, baca terakhir.
+// =====================================================================
+
+model ChatMessage {
+  id          String   @id @default(cuid())
+  projectId   String
+  authorId    String
+  body        String   @db.Text
+  // Pesan bisa "membawa" sebuah task sebagai konteks.
+  embedTaskId String?
+  isPinned    Boolean  @default(false)
+  pinnedAt    DateTime?
+  pinnedById  String?
+  editedAt    DateTime?
+
+  project     Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  author      User          @relation(fields: [authorId], references: [id])
+  embedTask   Task?         @relation("MessageEmbedTask", fields: [embedTaskId], references: [id], onDelete: SetNull)
+  mentions    MessageMention[]
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([projectId, createdAt])
+  @@index([authorId])
+  @@index([projectId, isPinned])
+}
+
+model MessageMention {
+  id         String  @id @default(cuid())
+  messageId  String
+  userId     String  // user yang di-mention
+
+  message    ChatMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt  DateTime @default(now())
+
+  @@unique([messageId, userId])
+  @@index([userId])
+}
+
+/// ChatRead: marker timestamp pesan terakhir yang dibaca user di suatu project.
+/// Dipakai untuk menghitung unread count.
+model ChatRead {
+  id         String   @id @default(cuid())
+  projectId  String
+  userId     String
+  lastReadAt DateTime @default(now())
+
+  project    Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, userId])
+}
+
+// =====================================================================
+// Notifikasi: kotak masuk in-app per user. Dipakai untuk bell/drawer.
+// =====================================================================
+
+model Notification {
+  id         String           @id @default(cuid())
+  userId     String           // penerima
+  type       NotificationType
+  title      String
+  body       String           @db.Text
+  link       String?          // URL relatif ke halaman terkait, mis. /tasks/<id>
+  isRead     Boolean          @default(false)
+  readAt     DateTime?
+  meta       Json?
+
+  user       User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt  DateTime         @default(now())
+
+  @@index([userId, isRead, createdAt])
+}
+
+// =====================================================================
+// PushSubscription: subscription Web Push per device/browser.
+// Satu user bisa punya banyak subscription (laptop, hp, dll.)
+// =====================================================================
+
+model PushSubscription {
+  id         String   @id @default(cuid())
+  userId     String
+  endpoint   String   @unique @db.VarChar(500)
+  p256dh     String   @db.VarChar(255)
+  auth       String   @db.VarChar(255)
+  userAgent  String?  @db.VarChar(500)
+
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt  DateTime @default(now())
+  lastUsedAt DateTime @default(now())
+
+  @@index([userId])
+}
